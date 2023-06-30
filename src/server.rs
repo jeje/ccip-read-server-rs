@@ -1,14 +1,28 @@
-use crate::types::CCIPReadHandler;
+use crate::types::{CCIPReadHandler, RPCCall, RPCResponse};
 use crate::CCIPReadMiddlewareError;
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use ethers_core::abi::{Abi, Function};
+use ethers_core::utils::hex;
 use serde::Deserialize;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
+use tower_http::trace::TraceLayer;
 use tracing::debug;
-use warp::Filter;
 
 type Handlers = HashMap<[u8; 4], (Function, Arc<dyn CCIPReadHandler + Sync + Send>)>;
+
+struct AppState {
+    handlers: Handlers,
+}
 
 /// CCIP-Read Server.
 #[derive(Clone)]
@@ -28,6 +42,7 @@ impl Server {
     /// Create a new server
     ///
     /// # Arguments
+    /// * `ip_address` the IP address to bind to
     /// * `port` the port the server should bind to
     pub fn new(ip_address: IpAddr, port: u16) -> Self {
         Server {
@@ -59,197 +74,148 @@ impl Server {
     }
 
     /// Starts a new CCIP-Read server.
-    pub async fn start(&self) -> Result<(), CCIPReadMiddlewareError> {
-        let api = filters::gateway(self.handlers.clone());
-        let routes = api.with(warp::log("gateway"));
-        let bound_interface: SocketAddr = SocketAddr::new(self.ip_address, self.port);
-        warp::serve(routes).run(bound_interface).await;
-        Ok(())
-    }
-}
-
-mod filters {
-    use super::{handlers, CCIPReadMiddlewareRequest, Handlers};
-    use warp::Filter;
-
-    pub fn gateway(
-        handlers: Handlers,
-    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        get(handlers.clone()).or(post(handlers.clone()))
-    }
-
-    pub fn get(
-        handlers: Handlers,
-    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        warp::path!("gateway" / String / String)
-            .and(warp::get())
-            .and(with_handlers(handlers))
-            .and_then(handlers::gateway_get)
-    }
-
-    pub fn post(
-        handlers: Handlers,
-    ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
-        warp::path!("gateway")
-            .and(warp::post())
-            .and(json_body())
-            .and(with_handlers(handlers))
-            .and_then(handlers::gateway_post)
-    }
-
-    fn with_handlers(
-        handlers: Handlers,
-    ) -> impl Filter<Extract = (Handlers,), Error = std::convert::Infallible> + Clone {
-        warp::any().map(move || handlers.clone())
-    }
-
-    fn json_body(
-    ) -> impl Filter<Extract = (CCIPReadMiddlewareRequest,), Error = warp::Rejection> + Clone {
-        // When accepting a body, we want a JSON body
-        // (and to reject huge payloads)...
-        warp::body::content_length_limit(1024 * 16).and(warp::body::json())
-    }
-}
-
-mod handlers {
-    use super::{CCIPReadMiddlewareRequest, Handlers};
-    use crate::{
-        types::{RPCCall, RPCResponse},
-        CCIPReadMiddlewareError,
-    };
-    use ethers_core::utils::hex;
-    use serde_json::json;
-    use std::{convert::Infallible, str::FromStr};
-    use tracing::debug;
-    use warp::hyper::StatusCode;
-
-    pub async fn gateway_get(
-        sender: String,
-        calldata: String,
-        handlers: Handlers,
-    ) -> Result<impl warp::Reply, Infallible> {
-        let calldata = String::from(calldata.strip_suffix(".json").unwrap_or(calldata.as_str()));
-        debug!("Should handle sender={:?} calldata={}", sender, calldata);
-
-        if let Ok(calldata) = ethers_core::types::Bytes::from_str(&calldata.as_str()[2..]) {
-            let response = call(
-                RPCCall {
-                    to: sender.clone(),
-                    data: calldata,
-                },
-                handlers,
-            )
-            .await
-            .unwrap();
-
-            let body = response.body;
-            Ok(warp::reply::with_status(
-                warp::reply::json(&body),
-                StatusCode::OK,
-            ))
+    ///
+    /// # Arguments
+    /// * `router` an optional Axum router to merge with the CCIP-Read one provided by the library
+    pub async fn start(&self, router: Option<Router>) -> Result<(), CCIPReadMiddlewareError> {
+        let ccip_router = self.router();
+        let app: Router = if let Some(router) = router {
+            router.merge(ccip_router)
         } else {
-            Ok(warp::reply::with_status(
-                warp::reply::json(&json!({
-                    "message": "Unexpected error",
-                })),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ))
-        }
-    }
-
-    pub async fn gateway_post(
-        data: CCIPReadMiddlewareRequest,
-        handlers: Handlers,
-    ) -> Result<impl warp::Reply, Infallible> {
-        let sender = data.sender;
-        let calldata = String::from(
-            data.calldata
-                .strip_suffix(".json")
-                .unwrap_or(data.calldata.as_str()),
-        );
-        debug!("Should handle sender={:?} calldata={}", sender, calldata);
-
-        if let Ok(calldata) = ethers_core::types::Bytes::from_str(&calldata.as_str()[2..]) {
-            let response = call(
-                RPCCall {
-                    to: sender.clone(),
-                    data: calldata,
-                },
-                handlers,
-            )
-            .await
-            .unwrap();
-
-            let body = response.body;
-            Ok(warp::reply::with_status(
-                warp::reply::json(&body),
-                StatusCode::OK,
-            ))
-        } else {
-            Ok(warp::reply::with_status(
-                warp::reply::json(&json!({
-                    "message": "Unexpected error",
-                })),
-                StatusCode::INTERNAL_SERVER_ERROR,
-            ))
-        }
-    }
-
-    #[tracing::instrument(
-        name = "ccip_server"
-        skip_all
-    )]
-    async fn call(
-        call: RPCCall,
-        handlers: Handlers,
-    ) -> Result<RPCResponse, CCIPReadMiddlewareError> {
-        debug!("Received call with {:?}", call);
-        let selector = &call.data[0..4];
-
-        // find a function handler for this selector
-        let handler = if let Some(handler) = handlers.get(selector) {
-            handler
-        } else {
-            return Ok(RPCResponse {
-                status: 404,
-                body: json!({
-                    "message": format!("No implementation for function with selector 0x{}", hex::encode(selector)),
-                }),
-            });
+            ccip_router
         };
 
-        // decode function arguments
-        let args = handler.0.decode_input(&call.data[4..])?;
+        let bound_interface: SocketAddr = SocketAddr::new(self.ip_address, self.port);
+        let _ = axum::Server::bind(&bound_interface)
+            .serve(app.into_make_service())
+            .await;
+        Ok(())
+    }
 
-        let callback = handler.1.clone();
-        if let Ok(tokens) = callback
-            .call(
-                args,
-                RPCCall {
-                    to: call.to,
-                    data: call.data,
-                },
-            )
-            .await
-        {
-            let encoded_data = ethers_core::abi::encode(&tokens);
-            let encoded_data = format!("0x{}", hex::encode(encoded_data));
-            debug!("Final encoded data: {}", encoded_data);
+    fn router(&self) -> Router {
+        let shared_state = Arc::new(AppState {
+            handlers: self.handlers.clone(),
+        });
+        Router::new()
+            .route("/gateway/:sender/:calldata", get(gateway_get))
+            .route("/gateway", post(gateway_post))
+            .with_state(shared_state)
+            .layer(TraceLayer::new_for_http())
+    }
+}
 
-            Ok(RPCResponse {
-                status: 200,
-                body: json!({
-                    "data": encoded_data,
-                }),
-            })
-        } else {
-            Ok(RPCResponse {
-                status: 500,
-                body: json!({
-                    "message": "Unexpected error",
-                }),
-            })
-        }
+async fn gateway_get(
+    Path((sender, calldata)): Path<(String, String)>,
+    State(app_state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let calldata = String::from(calldata.strip_suffix(".json").unwrap_or(calldata.as_str()));
+    debug!("Should handle sender={:?} calldata={}", sender, calldata);
+
+    if let Ok(calldata) = ethers_core::types::Bytes::from_str(&calldata.as_str()[2..]) {
+        let response = call(
+            RPCCall {
+                to: sender.clone(),
+                data: calldata,
+            },
+            app_state.handlers.clone(),
+        )
+        .await
+        .unwrap();
+
+        let body = response.body;
+        Ok((StatusCode::OK, Json(body)))
+    } else {
+        let error_message: Value = json!({
+            "message": "Unexpected error",
+        });
+        Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(error_message)))
+    }
+}
+
+async fn gateway_post(
+    State(app_state): State<Arc<AppState>>,
+    Json(data): Json<CCIPReadMiddlewareRequest>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let sender = data.sender;
+    let calldata = String::from(
+        data.calldata
+            .strip_suffix(".json")
+            .unwrap_or(data.calldata.as_str()),
+    );
+    debug!("Should handle sender={:?} calldata={}", sender, calldata);
+
+    if let Ok(calldata) = ethers_core::types::Bytes::from_str(&calldata.as_str()[2..]) {
+        let response = call(
+            RPCCall {
+                to: sender.clone(),
+                data: calldata,
+            },
+            app_state.handlers.clone(),
+        )
+        .await
+        .unwrap();
+
+        let body = response.body;
+        Ok((StatusCode::OK, Json(body)))
+    } else {
+        let error_message: Value = json!({
+            "message": "Unexpected error",
+        });
+        Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(error_message)))
+    }
+}
+
+#[tracing::instrument(
+    name = "ccip_server"
+    skip_all
+)]
+async fn call(call: RPCCall, handlers: Handlers) -> Result<RPCResponse, CCIPReadMiddlewareError> {
+    debug!("Received call with {:?}", call);
+    let selector = &call.data[0..4];
+
+    // find a function handler for this selector
+    let handler = if let Some(handler) = handlers.get(selector) {
+        handler
+    } else {
+        return Ok(RPCResponse {
+            status: 404,
+            body: json!({
+                "message": format!("No implementation for function with selector 0x{}", hex::encode(selector)),
+            }),
+        });
+    };
+
+    // decode function arguments
+    let args = handler.0.decode_input(&call.data[4..])?;
+
+    let callback = handler.1.clone();
+    if let Ok(tokens) = callback
+        .call(
+            args,
+            RPCCall {
+                to: call.to,
+                data: call.data,
+            },
+        )
+        .await
+    {
+        let encoded_data = ethers_core::abi::encode(&tokens);
+        let encoded_data = format!("0x{}", hex::encode(encoded_data));
+        debug!("Final encoded data: {}", encoded_data);
+
+        Ok(RPCResponse {
+            status: 200,
+            body: json!({
+                "data": encoded_data,
+            }),
+        })
+    } else {
+        Ok(RPCResponse {
+            status: 500,
+            body: json!({
+                "message": "Unexpected error",
+            }),
+        })
     }
 }
 
@@ -257,12 +223,15 @@ mod handlers {
 // http://localhost:8080/gateway/0x8464135c8f25da09e49bc8782676a84730c318bc/0x9061b92300000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000a047465737403657468000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000243b3b57deeb4f647bea6caa36333c816d7b46fdcb05f9466ecacc140ea8c66faf15b3d9f100000000000000000000000000000000000000000000000000000000.json
 #[cfg(test)]
 mod tests {
-    use crate::server::Handlers;
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
     use ethers::abi::AbiParser;
     use ethers::contract::BaseContract;
-    use serde_json::json;
-    use std::collections::HashMap;
-    use warp::hyper::body::Bytes;
+    use serde_json::{json, Value};
+    use tower::ServiceExt; // for `oneshot` and `ready`
 
     #[test]
     fn it_parse_offchain_resolver_abi() {
@@ -275,20 +244,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_get_on_unknown_selector() {
-        let handlers: Handlers = HashMap::new();
-        let filter = super::filters::get(handlers);
+        let server = Server::new(IpAddr::V4("127.0.0.1".parse().unwrap()), 8080);
+        let router = server.router();
 
-        let res = warp::test::request()
-            .path("/gateway/0x8464135c8f25da09e49bc8782676a84730c318bc/0x9061b92300000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000a0474657374036574680000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008459d1d43ceb4f647bea6caa36333c816d7b46fdcb05f9466ecacc140ea8c66faf15b3d9f100000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000005656d61696c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.json")
-            .reply(&filter)
-            .await;
-        assert_eq!(res.status(), 200);
+        let response = router
+            .oneshot(Request::builder().uri("/gateway/0x8464135c8f25da09e49bc8782676a84730c318bc/0x9061b92300000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000080000000000000000000000000000000000000000000000000000000000000000a0474657374036574680000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008459d1d43ceb4f647bea6caa36333c816d7b46fdcb05f9466ecacc140ea8c66faf15b3d9f100000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000005656d61696c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000.json").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
-            res.body(),
-            &Bytes::from(
-                json!({ "message": "No implementation for function with selector 0x9061b923"})
-                    .to_string()
-            )
+            body,
+            json!({ "message": "No implementation for function with selector 0x9061b923"})
         );
     }
 }
